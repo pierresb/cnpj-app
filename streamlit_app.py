@@ -1,20 +1,20 @@
 # app.py
 # CNPJ — Preparação e Consulta Básica (com seleção do TIPO e botões de FONTE)
+# Observação importante:
+# - Para aceitar uploads de até 500 MB, configure .streamlit/config.toml com:
+#   [server]
+#   maxUploadSize = 500
 
 from pathlib import Path
 import io
 import streamlit as st
 
 from lib.loaders import (
-    # pipeline pronto
-    prepare_from_uploaded_zip_bytes,
-    prepare_from_uploaded_csv_bytes,
-    query,
-    # peças para customizar palavras-chave por tipo
     download_zip,
     extract_tabular_from_zip,
     read_csv_semicolon_to_parquet,
     ensure_table_from_parquet,
+    query,
 )
 
 st.set_page_config(
@@ -23,10 +23,11 @@ st.set_page_config(
     layout="wide",
 )
 
+UPLOAD_LIMIT_MB = 500  # usado apenas para exibição e checagem no app
+
 st.title("🗂️ CNPJ — Preparação e Consulta Básica")
 st.caption(
-    "Carregue os conjuntos de dados a partir dos pacotes da RFB. "
-    "Este app lida com arquivos internos **sem extensão** e usa Parquet + DuckDB."
+    "Carregue os conjuntos da RFB. O app lida com arquivos internos **sem extensão** e usa Parquet + DuckDB."
 )
 
 # ---------------------------------------------------------------------
@@ -110,7 +111,7 @@ with b3:
     if st.button("🧾 Upload CSV", use_container_width=True):
         st.session_state.fonte = "Upload CSV"
 
-st.caption(f"Fonte atual selecionada: **{st.session_state.fonte}**")
+st.caption(f"Fonte atual selecionada: **{st.session_state.fonte}**  •  Limite de upload: **{UPLOAD_LIMIT_MB} MB**")
 
 # ---------------------------------------------------------------------
 # Ações por FONTE
@@ -143,7 +144,6 @@ with st.expander("⚙️ Preparar/Carregar dados", expanded=True):
 
         if st.button("Baixar e preparar", type="primary", use_container_width=True, disabled=not url):
             try:
-                # Fazemos aqui o pipeline manual para poder passar as keywords:
                 zip_path = Path("data") / f"{table_name}.zip"
                 download_zip(url, zip_path)
                 fobj = extract_tabular_from_zip(zip_path, prefer_keywords=keywords)
@@ -154,38 +154,46 @@ with st.expander("⚙️ Preparar/Carregar dados", expanded=True):
                 st.error(f"Falha ao preparar: {e}")
 
     elif fonte == "Upload ZIP":
+        st.caption(f"Aceita até **{UPLOAD_LIMIT_MB} MB** (ajustado no config.toml).")
         up_zip = st.file_uploader("Selecione um arquivo ZIP", type=["zip"])
-        if st.button("Preparar do ZIP", type="primary", use_container_width=True, disabled=up_zip is None):
-            try:
-                if up_zip is None:
-                    st.warning("Envie um ZIP para continuar.")
-                else:
-                    # Reaproveitamos a função pronta, mas queremos passar keywords:
-                    # então fazemos o pipeline manual similar ao caso de URL.
-                    tmp_zip = Path("data") / f"tmp_upload_{table_name}.zip"
-                    tmp_zip.write_bytes(up_zip.read())
+        if up_zip is not None:
+            size_mb = getattr(up_zip, "size", 0) / (1024 * 1024)
+            if size_mb > UPLOAD_LIMIT_MB:
+                st.error(f"O arquivo tem {size_mb:.1f} MB e excede o limite de {UPLOAD_LIMIT_MB} MB.")
+            else:
+                if st.button("Preparar do ZIP", type="primary", use_container_width=True):
                     try:
-                        fobj = extract_tabular_from_zip(tmp_zip, prefer_keywords=keywords)
-                        parquet = read_csv_semicolon_to_parquet(fobj, table_name)
-                        ensure_table_from_parquet(table_name, parquet, replace=True)
-                        st.success(f"Tabela **{table_name}** preparada (upload ZIP): `{parquet}`")
-                    finally:
-                        tmp_zip.unlink(missing_ok=True)
-            except Exception as e:
-                st.error(f"Falha ao preparar: {e}")
+                        tmp_zip = Path("data") / f"tmp_upload_{table_name}.zip"
+                        tmp_zip.write_bytes(up_zip.read())
+                        try:
+                            fobj = extract_tabular_from_zip(tmp_zip, prefer_keywords=keywords)
+                            parquet = read_csv_semicolon_to_parquet(fobj, table_name)
+                            ensure_table_from_parquet(table_name, parquet, replace=True)
+                            st.success(f"Tabela **{table_name}** preparada (upload ZIP): `{parquet}`")
+                        finally:
+                            tmp_zip.unlink(missing_ok=True)
+                    except Exception as e:
+                        st.error(f"Falha ao preparar: {e}")
+        else:
+            st.info("Envie um arquivo ZIP para prosseguir.")
 
     elif fonte == "Upload CSV":
+        st.caption(f"Aceita até **{UPLOAD_LIMIT_MB} MB** (ajustado no config.toml).")
         up_csv = st.file_uploader("Selecione um arquivo CSV", type=["csv"])
-        if st.button("Preparar do CSV", type="primary", use_container_width=True, disabled=up_csv is None):
-            try:
-                if up_csv is None:
-                    st.warning("Envie um CSV para continuar.")
-                else:
-                    parquet = read_csv_semicolon_to_parquet(io.BytesIO(up_csv.read()), table_name)
-                    ensure_table_from_parquet(table_name, parquet, replace=True)
-                    st.success(f"Tabela **{table_name}** preparada (upload CSV): `{parquet}`")
-            except Exception as e:
-                st.error(f"Falha ao preparar: {e}")
+        if up_csv is not None:
+            size_mb = getattr(up_csv, "size", 0) / (1024 * 1024)
+            if size_mb > UPLOAD_LIMIT_MB:
+                st.error(f"O arquivo tem {size_mb:.1f} MB e excede o limite de {UPLOAD_LIMIT_MB} MB.")
+            else:
+                if st.button("Preparar do CSV", type="primary", use_container_width=True):
+                    try:
+                        parquet = read_csv_semicolon_to_parquet(io.BytesIO(up_csv.read()), table_name)
+                        ensure_table_from_parquet(table_name, parquet, replace=True)
+                        st.success(f"Tabela **{table_name}** preparada (upload CSV): `{parquet}`")
+                    except Exception as e:
+                        st.error(f"Falha ao preparar: {e}")
+        else:
+            st.info("Envie um arquivo CSV para prosseguir.")
 
     else:
         st.info(
@@ -218,6 +226,6 @@ if st.button("Exibir amostra da tabela", use_container_width=True):
 # ---------------------------------------------------------------------
 st.divider()
 st.caption(
-    "Observações: leitura em chunks com separador `;`, tolerante a arquivo interno sem extensão; "
-    "conversão para Parquet e carga no DuckDB para consultas rápidas."
+    f"Observações: leitura em chunks com separador `;`, tolerante a arquivo interno sem extensão; "
+    f"conversão para Parquet e carga no DuckDB. Limite de upload configurado para {UPLOAD_LIMIT_MB} MB."
 )
