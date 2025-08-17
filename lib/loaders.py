@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import io
-import os
 import zipfile
 from pathlib import Path
 from typing import List, Tuple
@@ -124,17 +123,12 @@ def extract_tabular_from_zip(zip_path: Path, prefer_keywords: List[str] | None =
         member = _choose_zip_member(z, prefer_keywords)
         raw = z.read(member)
 
-    # Checagem leve de "CSV-like"
+    # Checagem leve de "CSV-like" (não estrita)
     head = raw[:4096]
     try:
-        sample = head.decode("latin1", errors="ignore")
+        _ = head.decode("latin1", errors="ignore")
     except Exception:
-        sample = head.decode("utf-8", errors="ignore")
-
-    # Se não tiver ';' na primeira linha, ainda pode ser CSV sem cabeçalho.
-    # Mantemos tolerante; a validação real ocorrerá na leitura por pandas.
-    # Você pode tornar estrito (raise) se preferir.
-    _ = sample.splitlines()[0] if sample else ""
+        _ = head.decode("utf-8", errors="ignore")
 
     return io.BytesIO(raw)
 
@@ -180,7 +174,7 @@ def read_csv_semicolon_to_parquet(
 
     parts: List[str] = []
     for i, chunk in enumerate(it):
-        # normalização leve (opcional): garantir string em todas as colunas
+        # normalização leve: garantir string em todas as colunas
         for c in chunk.columns:
             if chunk[c].dtype != "object":
                 chunk[c] = chunk[c].astype("string")
@@ -269,123 +263,3 @@ def save_parquet(df: pd.DataFrame, name: str) -> Path:
     path = DATA / f"{name}.parquet"
     df.to_parquet(path, index=False)
     return path
-
-# ======== ACRESCENTAR AO FINAL DO ARQUIVO loaders.py =========
-from datetime import datetime
-
-# ---- Catálogo (tabela de controle) ---------------------------------
-def _ensure_catalog():
-    con = open_con()
-    try:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS catalog (
-              id IDENTITY,
-              dataset TEXT NOT NULL,          -- ex.: 'empresas', 'estabelecimentos'...
-              month_ref TEXT NOT NULL,        -- '2025-06'
-              source_url TEXT,
-              parquet_path TEXT NOT NULL,
-              rows BIGINT,
-              loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    finally:
-        con.close()
-
-def _count_rows_in_parquet(parquet_path: Path) -> int:
-    con = open_con()
-    try:
-        return con.execute(
-            f"SELECT COUNT(*) AS n FROM parquet_scan('{parquet_path.as_posix()}')"
-        ).fetchone()[0]
-    finally:
-        con.close()
-
-def add_to_catalog(dataset: str, month_ref: str, parquet_path: Path, source_url: str | None, rows: int | None = None):
-    _ensure_catalog()
-    if rows is None:
-        try:
-            rows = _count_rows_in_parquet(parquet_path)
-        except Exception:
-            rows = None
-    con = open_con()
-    try:
-        con.execute(
-            "INSERT INTO catalog (dataset, month_ref, source_url, parquet_path, rows, loaded_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (dataset, month_ref, source_url or "", parquet_path.as_posix(), rows, datetime.now())
-        )
-    finally:
-        con.close()
-
-def get_catalog():
-    _ensure_catalog()
-    return query("SELECT id, dataset, month_ref, source_url, parquet_path, rows, loaded_at FROM catalog ORDER BY loaded_at DESC")
-
-# ---- Bulk download por mês/ano -------------------------------------
-_EXPECTED_FILES = {
-    # Você pode ajustar ou expandir conforme a pasta do mês no portal
-    # Chaves são nomes “lógicos” para escolher keywords corretas
-    "empresas": ["Empresas1.zip", "Empresas2.zip"],
-    "estabelecimentos": ["Estabelecimentos1.zip", "Estabelecimentos2.zip", "Estabelecimentos3.zip"],
-    "socios": ["Socios1.zip", "Socios2.zip"],
-    "simples": ["Simples.zip"],
-    "paises": ["Paises.zip"],
-    "municipios": ["Municipios.zip"],
-    "qualificacoes": ["Qualificacoes.zip"],
-    "naturezas": ["Naturezas.zip"],
-    "cnaes": ["Cnaes.zip"],
-}
-
-# Palavras-chave para achar o arquivo “sem extensão” dentro do zip
-_DATASET_KEYWORDS = {
-    "empresas": ["empresas", "empresa"],
-    "estabelecimentos": ["estabelec", "estabelecimentos"],
-    "socios": ["socios", "sócios", "socio"],
-    "simples": ["simples", "mei"],
-    "paises": ["paises", "países", "pais"],
-    "municipios": ["municipio", "municípios", "municipios"],
-    "qualificacoes": ["qualificacao", "qualificações", "qualificacoes"],
-    "naturezas": ["natureza", "naturezas"],
-    "cnaes": ["cnae", "cnaes"],
-}
-
-def month_dir_url(year: int, month: int) -> str:
-    # Ex.: https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2025-06/
-    return f"https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/{year:04d}-{month:02d}/"
-
-def prepare_all_for_month(year: int, month: int, datasets: list[str] | None = None) -> list[tuple[str, Path]]:
-    """
-    Faz download e prepara TODOS os conjuntos desejados para o mês/ano.
-    - datasets=None => prepara todos os chaves de _EXPECTED_FILES
-    Retorna lista [(dataset, parquet_path), ...]
-    """
-    base = month_dir_url(year, month)
-    targets = datasets or list(_EXPECTED_FILES.keys())
-    prepared = []
-
-    for dataset in targets:
-        files = _EXPECTED_FILES.get(dataset, [])
-        keywords = _DATASET_KEYWORDS.get(dataset, [dataset])
-        for fname in files:
-            url = base + fname
-            try:
-                zip_path = DATA / f"{dataset}_{fname}"
-                download_zip(url, zip_path)
-                fobj = extract_tabular_from_zip(zip_path, prefer_keywords=keywords)
-                parquet = read_csv_semicolon_to_parquet(fobj, dataset)
-                ensure_table_from_parquet(dataset, parquet, replace=True)
-                add_to_catalog(dataset, f"{year:04d}-{month:02d}", parquet, url)
-                prepared.append((dataset, parquet))
-            except Exception as e:
-                # segue para o próximo arquivo; é comum alguns meses não terem todos os pacotes
-                print(f"[WARN] Falhou em {url}: {e}")
-    return prepared
-
-# ---- Parquet/CSV em memória (para exportar) -------------------------
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False, sep=";").encode("utf-8")
-
-def df_to_parquet_bytes(df: pd.DataFrame) -> bytes:
-    bio = io.BytesIO()
-    df.to_parquet(bio, index=False)
-    return bio.getvalue()
-# ======== FIM DO BLOCO NOVO loaders.py =========
