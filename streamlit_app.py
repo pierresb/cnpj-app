@@ -5,11 +5,6 @@
 #   [server]
 #   maxUploadSize = 500
 
-# no topo do app.py
-from lib.ui import inject_global_css
-# ...
-inject_global_css()
-
 from pathlib import Path
 import io
 import streamlit as st
